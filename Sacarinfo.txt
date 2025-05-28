@@ -1,0 +1,243 @@
+import os
+import re
+import requests
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+import time
+import random
+import json    # ¡IMPORTANTE! Este import es necesario para usar json.dump()
+
+# --- Configuración Global ---
+CAETANORETAIL_BASE_URL = "https://www.caetanoretail.es/bmw/stock-vo/"
+
+
+def extraer_info_publicaciones_caetanoretail(url_limit=None):
+    print(f"Iniciando la extracción de información de publicaciones de: {CAETANORETAIL_BASE_URL}")
+    car_data_list = []
+    extracted_urls = set()
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=False,  # Mantener en False para depurar visualmente
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-setuid-sandbox"
+            ]
+        )
+        page = browser.new_page(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+        page.set_viewport_size({"width": 1366, "height": 768})
+
+        try:
+            print(f"Navegando a {CAETANORETAIL_BASE_URL}...")
+            # wait_until='domcontentloaded' es más rápido para la carga inicial de HTML
+            page.goto(CAETANORETAIL_BASE_URL, wait_until="domcontentloaded", timeout=90000)
+            print("Página de Caetanoretail BMW cargada (DOM completo).")
+            time.sleep(random.uniform(3, 5))
+
+            # --- Manejo de cookies ---
+            cookie_accept_selector = 'button[data-cky-tag="accept-button"]'
+            try:
+                print(f"Intentando aceptar cookies con selector: '{cookie_accept_selector}'")
+                # Esperar a que el botón esté presente y visible
+                page.wait_for_selector(cookie_accept_selector, state='visible', timeout=15000)
+                if page.locator(cookie_accept_selector).is_visible():
+                    page.click(cookie_accept_selector)
+                    print("Se hizo clic en el botón 'Aceptar todo' de cookies.")
+                    # Esperar a que la red se calme después del clic de cookies
+                    page.wait_for_load_state('networkidle', timeout=30000)
+                else:
+                    print("INFO: El botón de cookies no está visible.")
+                time.sleep(random.uniform(2, 4))
+            except PlaywrightTimeoutError:
+                print("INFO: No se encontró el banner de cookies o el botón de aceptación a tiempo.")
+            except Exception as e:
+                print(f"ADVERTENCIA: Error al intentar manejar el banner de cookies: {e}")
+
+            # --- Esperar a que el contenedor principal de los resultados de búsqueda esté presente ---
+            search_results_container_selector = 'div.search-grid--container'
+            try:
+                print(f"Esperando que el contenedor de resultados de búsqueda ('{search_results_container_selector}') esté visible...")
+                page.wait_for_selector(search_results_container_selector, state='visible', timeout=30000)
+                print("Contenedor de resultados de búsqueda visible.")
+                time.sleep(random.uniform(2, 3))
+            except PlaywrightTimeoutError:
+                print("ERROR: El contenedor principal de resultados de búsqueda no apareció a tiempo. La página podría no haber cargado correctamente o el selector ha cambiado.")
+                browser.close()
+                return []
+
+            # Selector para las tarjetas de vehículos individuales
+            vehicle_card_selector = 'div.vehicle-card-container'
+            # Selector para los enlaces dentro de esas tarjetas
+            car_link_selector = f'{vehicle_card_selector} a.baselink'
+
+            try:
+                print(f"Esperando al menos una tarjeta de vehículo ('{vehicle_card_selector}') para asegurar que el contenido dinámico esté cargado...")
+                page.wait_for_selector(vehicle_card_selector, state='attached', timeout=20000)
+                print("INFO: Se detectaron tarjetas de vehículos en la carga inicial.")
+                time.sleep(random.uniform(1, 2))
+            except PlaywrightTimeoutError:
+                print("ERROR: No se encontraron tarjetas de vehículos después de la carga inicial. Verifique el selector o la página.")
+                browser.close()
+                return []
+            except Exception as e:
+                print(f"ERROR: Error al esperar las tarjetas de vehículos en la carga inicial: {e}")
+                browser.close()
+                return []
+
+            # --- Lógica de Carga de "Ver más" ---
+            no_progress_attempts = 0
+            MAX_NO_PROGRESS_ATTEMPTS = 7 # Aumentado para dar más oportunidades
+            ver_mas_button_selector = 'button.no-results--button.primary'
+
+            while True:
+                if url_limit is not None and len(car_data_list) >= url_limit:
+                    print(f"INFO: Límite de {url_limit} vehículos alcanzado. Deteniendo la extracción.")
+                    break
+
+                # Obtener el número de elementos de anuncios en el DOM antes de la acción de "Ver más"
+                initial_dom_ad_count = page.locator(vehicle_card_selector).count()
+                print(f"\n--- Iteración de Extracción ---")
+                print(f"DEBUG: Tarjetas de vehículos en el DOM antes de intentar 'Ver más': {initial_dom_ad_count}")
+                print(f"DEBUG: Vehículos únicos extraídos hasta ahora: {len(extracted_urls)}")
+
+                ver_mas_button_found = False
+                try:
+                    # Esperar a que el botón "Ver más" sea visible
+                    page.wait_for_selector(ver_mas_button_selector, state='visible', timeout=7000) # Increased timeout
+                    ver_mas_button_locator = page.locator(ver_mas_button_selector)
+
+                    if ver_mas_button_locator.is_enabled():
+                        # Desplazarse al botón para asegurar que esté en el viewport y sea clicable
+                        ver_mas_button_locator.scroll_into_view_if_needed()
+                        time.sleep(random.uniform(1, 2)) # Pequeña pausa después del scroll
+                        ver_mas_button_found = True
+                        print(f"DEBUG: Botón 'Ver más' encontrado, habilitado y en vista con texto: '{ver_mas_button_locator.text_content()}'")
+                    else:
+                        print("DEBUG: Botón 'Ver más' encontrado pero no habilitado.")
+                except PlaywrightTimeoutError:
+                    print("DEBUG: Botón 'Ver más' no visible o no encontrado en esta iteración.")
+                except Exception as e:
+                    print(f"ADVERTENCIA: Error al buscar el botón 'Ver más': {e}")
+                    pass
+
+                if ver_mas_button_found:
+                    try:
+                        print(f"INFO: Haciendo clic en el botón 'Ver más'...")
+                        ver_mas_button_locator.click(timeout=10000)
+                        # Esperar a que el número de elementos de anuncios aumente significativamente
+                        # O un timeout más largo si no hay un incremento inmediato
+                        page.wait_for_function(
+                            f'document.querySelectorAll("{vehicle_card_selector}").length > {initial_dom_ad_count}',
+                            timeout=45000) # Tiempo de espera más largo
+                        print("INFO: Detectadas más tarjetas de vehículos en el DOM después de hacer clic en 'Ver más'.")
+                        # Esperar un poco más para que todos los elementos se rendericen completamente
+                        page.wait_for_load_state('networkidle', timeout=60000)
+                        print("INFO: Red inactiva después de hacer clic en 'Ver más'.")
+                        time.sleep(random.uniform(3, 5))
+                    except PlaywrightTimeoutError:
+                        print("ADVERTENCIA: Timeout al intentar hacer clic en 'Ver más' o esperar nuevos elementos. Asumiendo fin del contenido o problema de carga.")
+                        break
+                    except Exception as e:
+                        print(f"ERROR: Error inesperado durante el clic en 'Ver más' o la espera de nuevos elementos: {e}")
+                        break
+                else:
+                    print("INFO: No se encontró el botón 'Ver más' o ya no hay más elementos para cargar. Fin de la extracción.")
+                    break
+
+                # Obtener el HTML y parsear después de la acción de "Ver más"
+                html_content = page.content()
+                soup = BeautifulSoup(html_content, 'html.parser')
+
+                vehicle_cards = soup.find_all('div', class_='vehicle-card-container')
+                print(f"DEBUG: BeautifulSoup encontró {len(vehicle_cards)} tarjetas de vehículos en el HTML actual.")
+
+                current_iteration_new_urls_count = 0
+                for card in vehicle_cards:
+                    car_info = {}
+                    link_tag = card.find('a', class_='baselink')
+                    if link_tag and link_tag.get('href'):
+                        href = link_tag.get('href')
+                        full_url = requests.compat.urljoin("https://www.caetanoretail.es/", href)
+                        if re.match(r'https:\/\/www\.caetanoretail\.es\/bmw\/vehiculo\/[a-zA-Z0-9]+\/?$', full_url) and full_url not in extracted_urls:
+                            car_info['url'] = full_url
+                            extracted_urls.add(full_url)
+                            current_iteration_new_urls_count += 1
+                        else:
+                            continue
+                    else:
+                        continue
+
+                    car_info['modelo'] = card.find('h3', class_='heading model').text.strip() if card.find('h3', class_='heading model') else 'N/A'
+                    car_info['designacion'] = card.find('h4', class_='heading designation').text.strip() if card.find('h4', class_='heading designation') else 'N/A'
+                    car_info['precio'] = card.select_one('div.financial-price-total p.text-label.regular').text.strip() if card.select_one('div.financial-price-total p.text-label.regular') else 'N/A'
+                    car_info['kilometros'] = card.select_one('div.vehicle-km p.text-label.regular').text.strip() if card.select_one('div.vehicle-km p.text-label.regular') else 'N/A'
+                    car_info['combustible'] = card.select_one('div.vehicle-fuel p.text-label.regular').text.strip() if card.select_one('div.vehicle-fuel p.text-label.regular') else 'N/A'
+                    car_info['transmision'] = card.select_one('div.vehicle-transmission p.text-label.regular').text.strip() if card.select_one('div.vehicle-transmission p.text-label.regular') else 'N/A'
+                    car_info['cv'] = card.select_one('div.vehicle-hp p.text-label.regular').text.strip() if card.select_one('div.vehicle-hp p.text-label.regular') else 'N/A'
+                    car_info['cilindrada_cc'] = card.select_one('div.vehicle-year p.text-label.regular').text.strip() if card.select_one('div.vehicle-year p.text-label.regular') else 'N/A'
+                    car_info['ubicacion'] = card.select_one('div.vehicle-place p.text-ellipsis.text-label.regular').text.strip() if card.select_one('div.vehicle-place p.text-ellipsis.text-label.regular') else 'N/A'
+
+                    car_data_list.append(car_info)
+                    # No imprimir cada coche aquí para evitar un output muy largo, solo el progreso.
+
+                    if url_limit is not None and len(car_data_list) >= url_limit:
+                        print(f"INFO: Límite de {url_limit} vehículos alcanzado. Deteniendo la extracción.")
+                        break
+
+                print(f"INFO: Nuevos vehículos únicos extraídos en esta iteración: {current_iteration_new_urls_count}")
+                print(f"INFO: Total de vehículos extraídos hasta ahora: {len(car_data_list)}")
+
+                if url_limit is not None and len(car_data_list) >= url_limit:
+                    break
+
+                # Comprobar el progreso: si se añadieron nuevas URLs únicas
+                # Esta es la verificación más importante para detectar si el botón "Ver más" funcionó
+                if current_iteration_new_urls_count > 0:
+                    no_progress_attempts = 0
+                    print("INFO: Se detectaron nuevos vehículos. Continuando...")
+                else:
+                    no_progress_attempts += 1
+                    print(f"ADVERTENCIA: No se detectaron nuevos vehículos en esta iteración. Intentos consecutivos sin progreso: {no_progress_attempts}/{MAX_NO_PROGRESS_ATTEMPTS}")
+                    if no_progress_attempts >= MAX_NO_PROGRESS_ATTEMPTS:
+                        print("INFO: Máximo de intentos sin progreso alcanzado. Fin de la carga.")
+                        break
+
+                time.sleep(random.uniform(1, 2))
+
+        except Exception as e:
+            print(f"ERROR CRÍTICO: Ocurrió un error general durante la extracción: {e}")
+        finally:
+            print("Cerrando el navegador.")
+            browser.close()
+
+    return car_data_list
+
+
+def main():
+    url_limit_to_extract = None
+    all_car_details = extraer_info_publicaciones_caetanoretail(url_limit=url_limit_to_extract)
+
+    if all_car_details:
+        print(
+            f"\n--- Extracción finalizada. Total de vehículos encontrados: {len(all_car_details)} ---")
+
+        if url_limit_to_extract is not None:
+            output_filename = f"caetanoretail_bmw_info_de_{url_limit_to_extract}.json"
+        else:
+            output_filename = "1.json"
+
+        try:
+            with open(output_filename, 'w', encoding='utf-8') as f:
+                json.dump(all_car_details, f, ensure_ascii=False, indent=4)
+            print(f"Información de vehículos guardada exitosamente en '{output_filename}'")
+        except IOError as e:
+            print(f"Error al intentar guardar la información en el archivo '{output_filename}': {e}")
+
+    else:
+        print("No se encontró información de vehículos para guardar.")
+
+
+if __name__ == "__main__":
+    main()
